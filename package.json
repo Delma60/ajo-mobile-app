@@ -4,9 +4,17 @@
   "main": "index.js",
   "dependencies": {
     "expo": "~56.0.8",
+    "expo-haptics": "~56.0.3",
+    "expo-linking": "~56.0.13",
+    "expo-network": "^56.0.4",
+    "expo-secure-store": "^56.0.4",
+    "expo-splash-screen": "^56.0.10",
     "expo-status-bar": "~56.0.4",
+    "expo-web-browser": "~56.0.5",
     "react": "19.2.3",
-    "react-native": "0.85.3"
+    "react-native": "0.85.3",
+    "react-native-safe-area-context": "~5.7.0",
+    "react-native-webview": "13.16.1"
   },
   "scripts": {
     "start": "expo start",
