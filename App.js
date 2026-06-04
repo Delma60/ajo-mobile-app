@@ -51,7 +51,7 @@ function buildGoogleOAuthUrl() {
     scope: 'openid email profile',
     prompt: 'select_account',
     // Pass a state param so the callback can redirect to the right scheme
-    state: encodeURIComponent(AUTH_SUCCESS_SCHEME),
+    state: AUTH_SUCCESS_SCHEME,
   });
   console.log(OAUTH_CALLBACK_URL)
   return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
@@ -278,6 +278,14 @@ export default function App() {
   // JavaScript injected into every page — signals the app is in a WebView
   const injectedJavaScript = `
     (function() {
+      var meta = document.querySelector('meta[name="viewport"]');
+      if (!meta) {
+        meta = document.createElement('meta');
+        meta.name = 'viewport';
+        document.head.appendChild(meta);
+      }
+      meta.setAttribute('content', 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no');
+
       // Flag for Next.js components to detect they're inside the native wrapper
       window.__NATIVE_APP__ = true;
       window.ReactNativeWebView?.postMessage(
@@ -324,6 +332,7 @@ export default function App() {
         onShouldStartLoadWithRequest={handleShouldStartLoad}
         onMessage={handleWebViewMessage}
         injectedJavaScript={injectedJavaScript}
+        scalesPageToFit={false}
         allowsInlineMediaPlayback
         sharedCookiesEnabled
         thirdPartyCookiesEnabled
@@ -332,12 +341,7 @@ export default function App() {
         allowsBackForwardNavigationGestures
         style={styles.webview}
       />
-      {isLoading && (
-        <View style={styles.spinnerOverlay}>
-          <ActivityIndicator size="large" color="#047857" />
-          <Text style={styles.loadingText}>Loading…</Text>
-        </View>
-      )}
+      
     </SafeAreaView>
   );
 }
