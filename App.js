@@ -415,7 +415,7 @@ export default function App() {
         startInLoadingState
       />
 
-      <LoadingOverlay visible={isLoading} slowLoad={slowLoad} />
+      {/* <LoadingOverlay visible={isLoading} slowLoad={slowLoad} /> */}
     </SafeAreaView>
   );
 }
