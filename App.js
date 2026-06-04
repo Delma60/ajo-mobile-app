@@ -1,15 +1,18 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Animated,
   BackHandler,
   Linking,
   Platform,
   StyleSheet,
   Text,
+  TouchableOpacity,
   View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
+import * as Haptics from 'expo-haptics';
 import * as Network from 'expo-network';
 import * as SplashScreen from 'expo-splash-screen';
 import * as WebBrowser from 'expo-web-browser';
@@ -17,20 +20,14 @@ import { WebView } from 'react-native-webview';
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const APP_URL = 'https://ajo-app-ebo2.vercel.app';
-
-// Custom URL scheme — must match app.json "scheme" field
-// Register this in app.json: { "expo": { "scheme": "mobileapp" } }
 const APP_SCHEME = 'mobileapp';
-
-// After Google auth, your Next.js callback will redirect here.
-// The in-app browser detects this scheme and closes automatically.
 const AUTH_SUCCESS_SCHEME = `${APP_SCHEME}://auth-complete`;
-
-// The Next.js route that handles the Google OAuth callback.
-// It must: verify the token → set session cookie → redirect to AUTH_SUCCESS_SCHEME
 const OAUTH_CALLBACK_URL = `${APP_URL}/api/auth/google-callback`;
 
-// ─── Auth URL patterns that must never load inside the WebView ───────────────
+// How long to wait before showing the "taking too long" nudge (ms)
+const SLOW_LOAD_THRESHOLD = 8000;
+
+// Auth URL patterns that must never load inside the WebView
 const AUTH_URL_PATTERNS = [
   'accounts.google.com',
   'oauth2.googleapis.com',
@@ -38,11 +35,7 @@ const AUTH_URL_PATTERNS = [
   'securetoken.googleapis.com',
 ];
 
-// ─── Google OAuth URL ─────────────────────────────────────────────────────────
-// We bypass Firebase's signInWithRedirect entirely and call Google OAuth directly.
-// The Next.js callback route receives the code, exchanges it for tokens,
-// calls firebase-admin to create a custom token or session, then redirects
-// to AUTH_SUCCESS_SCHEME so the in-app browser closes.
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 function buildGoogleOAuthUrl() {
   const params = new URLSearchParams({
     client_id: process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID ?? '',
@@ -50,50 +43,159 @@ function buildGoogleOAuthUrl() {
     response_type: 'code',
     scope: 'openid email profile',
     prompt: 'select_account',
-    // Pass a state param so the callback can redirect to the right scheme
     state: AUTH_SUCCESS_SCHEME,
   });
-  console.log(OAUTH_CALLBACK_URL)
   return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
 }
 
+// ─── Offline Screen ───────────────────────────────────────────────────────────
+function OfflineScreen({ onRetry }) {
+  const fadeAnim = useRef(new Animated.Value(0)).current;
+  const slideAnim = useRef(new Animated.Value(24)).current;
+
+  useEffect(() => {
+    Animated.parallel([
+      Animated.timing(fadeAnim, {
+        toValue: 1,
+        duration: 400,
+        useNativeDriver: true,
+      }),
+      Animated.timing(slideAnim, {
+        toValue: 0,
+        duration: 400,
+        useNativeDriver: true,
+      }),
+    ]).start();
+  }, [fadeAnim, slideAnim]);
+
+  const handleRetry = async () => {
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    onRetry();
+  };
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <StatusBar style="dark" />
+      <Animated.View
+        style={[
+          styles.centeredContent,
+          { opacity: fadeAnim, transform: [{ translateY: slideAnim }] },
+        ]}
+      >
+        <View style={styles.offlineIconWrap}>
+          <Text style={styles.offlineIcon}>📡</Text>
+        </View>
+        <Text style={styles.offlineTitle}>No Connection</Text>
+        <Text style={styles.offlineMessage}>
+          Please check your internet connection and try again.
+        </Text>
+        <TouchableOpacity
+          style={styles.retryButton}
+          onPress={handleRetry}
+          activeOpacity={0.75}
+        >
+          <Text style={styles.retryButtonText}>Try Again</Text>
+        </TouchableOpacity>
+      </Animated.View>
+    </SafeAreaView>
+  );
+}
+
+// ─── Loading Overlay ──────────────────────────────────────────────────────────
+function LoadingOverlay({ visible, slowLoad }) {
+  const opacity = useRef(new Animated.Value(visible ? 1 : 0)).current;
+
+  useEffect(() => {
+    Animated.timing(opacity, {
+      toValue: visible ? 1 : 0,
+      duration: 300,
+      useNativeDriver: true,
+    }).start();
+  }, [visible, opacity]);
+
+  return (
+    <Animated.View
+      pointerEvents={visible ? 'auto' : 'none'}
+      style={[styles.loadingOverlay, { opacity }]}
+    >
+      <ActivityIndicator size="large" color="#047857" />
+      <Text style={styles.loadingText}>
+        {slowLoad ? 'Still loading…' : 'Loading…'}
+      </Text>
+      {slowLoad && (
+        <Text style={styles.slowLoadHint}>
+          This is taking longer than usual.{'\n'}Check your connection.
+        </Text>
+      )}
+    </Animated.View>
+  );
+}
+
+// ─── Main App ─────────────────────────────────────────────────────────────────
 export default function App() {
   const webviewRef = useRef(null);
+
+  // Network
   const [isConnected, setIsConnected] = useState(true);
-  const [isLoading, setIsLoading] = useState(true);
-  const [canGoBack, setCanGoBack] = useState(false);
+  const [wasOffline, setWasOffline] = useState(false);
+
+  // App readiness
   const [appIsReady, setAppIsReady] = useState(false);
+
+  // WebView loading state
+  const [isLoading, setIsLoading] = useState(true);
+  const [slowLoad, setSlowLoad] = useState(false);
+  const slowLoadTimer = useRef(null);
+
+  // Navigation
+  const [canGoBack, setCanGoBack] = useState(false);
+
+  // Auth
   const [authInProgress, setAuthInProgress] = useState(false);
 
-  // ── Warm up the browser for faster auth open ──────────────────────────────
+  // ── Browser warm-up ──────────────────────────────────────────────────────
   useEffect(() => {
     WebBrowser.warmUpAsync();
     return () => { WebBrowser.coolDownAsync(); };
   }, []);
 
-  // ── Network & lifecycle setup ──────────────────────────────────────────────
+  // ── Network polling ───────────────────────────────────────────────────────
+  const checkNetwork = useCallback(async () => {
+    try {
+      const state = await Network.getNetworkStateAsync();
+      const connected = !!state.isConnected && state.isInternetReachable !== false;
+      setIsConnected(prev => {
+        if (!prev && connected) {
+          // Coming back online — reload WebView automatically
+          setWasOffline(true);
+        }
+        return connected;
+      });
+    } catch {
+      setIsConnected(true);
+    }
+  }, []);
+
+  // Auto-reload when coming back online
+  useEffect(() => {
+    if (wasOffline && isConnected) {
+      setWasOffline(false);
+      setTimeout(() => webviewRef.current?.reload(), 300);
+    }
+  }, [wasOffline, isConnected]);
+
+  // ── App lifecycle ─────────────────────────────────────────────────────────
   useEffect(() => {
     let mounted = true;
 
-    async function prepareApp() {
+    async function prepare() {
       try { await SplashScreen.preventAutoHideAsync(); } catch {}
+      await checkNetwork();
+      if (mounted) setAppIsReady(true);
     }
 
-    async function checkNetwork() {
-      try {
-        const state = await Network.getNetworkStateAsync();
-        if (mounted) {
-          setIsConnected(!!state.isConnected && state.isInternetReachable !== false);
-        }
-      } catch {
-        if (mounted) setIsConnected(true);
-      }
-    }
-
-    // Handle deep links when the app is already open (foreground)
     const handleDeepLink = ({ url }) => {
       if (!mounted) return;
-      console.log('[DeepLink] Received:', url);
       if (url.startsWith(AUTH_SUCCESS_SCHEME)) {
         setTimeout(() => webviewRef.current?.reload(), 400);
       }
@@ -103,36 +205,32 @@ export default function App() {
       try {
         const initialUrl = await Linking.getInitialURL();
         if (initialUrl?.startsWith(AUTH_SUCCESS_SCHEME)) {
-          console.log('[DeepLink] Cold start from auth callback:', initialUrl);
           setTimeout(() => webviewRef.current?.reload(), 400);
         }
-      } catch (error) {
-        console.warn('[DeepLink] getInitialURL failed', error);
-      }
+      } catch {}
     }
 
-    prepareApp();
-    checkNetwork();
+    prepare();
     handleInitialUrl();
-    const interval = setInterval(checkNetwork, 15000);
-    const linkingSubscription = Linking.addEventListener('url', handleDeepLink);
+
+    const networkInterval = setInterval(checkNetwork, 10000);
+    const linkingSub = Linking.addEventListener('url', handleDeepLink);
 
     return () => {
       mounted = false;
-      clearInterval(interval);
-      linkingSubscription?.remove();
+      clearInterval(networkInterval);
+      linkingSub?.remove();
     };
-  }, []);
+  }, [checkNetwork]);
 
-  // Hide splash when offline
+  // Hide splash once ready
   useEffect(() => {
-    if (!isConnected && !appIsReady) {
+    if (appIsReady) {
       SplashScreen.hideAsync().catch(() => null);
-      setAppIsReady(true);
     }
-  }, [isConnected, appIsReady]);
+  }, [appIsReady]);
 
-  // Android hardware back button
+  // ── Android back button ───────────────────────────────────────────────────
   useEffect(() => {
     const onBackPress = () => {
       if (canGoBack && webviewRef.current) {
@@ -145,139 +243,114 @@ export default function App() {
     return () => sub.remove();
   }, [canGoBack]);
 
-  // ── WebView handlers ───────────────────────────────────────────────────────
+  // ── Slow-load detection ───────────────────────────────────────────────────
+  const startSlowLoadTimer = () => {
+    clearTimeout(slowLoadTimer.current);
+    setSlowLoad(false);
+    slowLoadTimer.current = setTimeout(() => setSlowLoad(true), SLOW_LOAD_THRESHOLD);
+  };
 
+  const clearSlowLoadTimer = () => {
+    clearTimeout(slowLoadTimer.current);
+    setSlowLoad(false);
+  };
+
+  // ── WebView handlers ──────────────────────────────────────────────────────
   const handleNavigationStateChange = (navState) => {
     setCanGoBack(navState.canGoBack);
   };
 
-  /**
-   * Block Google/Firebase auth URLs from loading inside the WebView.
-   * Any auth URL that slips through (e.g. from a JS redirect) is intercepted here.
-   */
   const handleShouldStartLoad = (request) => {
-    const url = request.url;
-
-    // Block known auth provider URLs from inside WebView
-    if (AUTH_URL_PATTERNS.some((p) => url.includes(p))) {
-      console.log('[WebView] Blocked auth URL from loading inside WebView:', url);
-      return false;
-    }
-
-    // If somehow the callback URL fires inside WebView, block and reload instead
-    if (url.startsWith(APP_SCHEME + '://')) {
-      console.log('[WebView] Blocked custom scheme URL:', url);
-      return false;
-    }
-
+    const { url } = request;
+    if (AUTH_URL_PATTERNS.some(p => url.includes(p))) return false;
+    if (url.startsWith(`${APP_SCHEME}://`)) return false;
     return true;
   };
 
-  const handleWebViewLoadEnd = async () => {
-    setIsLoading(false);
-    if (!appIsReady) {
-      await SplashScreen.hideAsync().catch(() => null);
-      setAppIsReady(true);
-    }
+  const handleLoadStart = () => {
+    setIsLoading(true);
+    startSlowLoadTimer();
   };
 
-  /**
-   * Messages from window.ReactNativeWebView.postMessage(...) in Next.js.
-   * Your Next.js GoogleAuthButton should post:
-   *   { type: 'INITIATE_GOOGLE_LOGIN' }
-   * instead of calling Firebase signInWithRedirect/signInWithPopup.
-   */
+  const handleLoadEnd = async () => {
+    clearSlowLoadTimer();
+    setIsLoading(false);
+  };
+
+  const handleError = (syntheticEvent) => {
+    const { nativeEvent } = syntheticEvent;
+    console.warn('[WebView] Error:', nativeEvent.description);
+    clearSlowLoadTimer();
+    setIsLoading(false);
+  };
+
+  // ── Auth ──────────────────────────────────────────────────────────────────
   const handleWebViewMessage = async (event) => {
     try {
       const data = JSON.parse(event.nativeEvent.data);
-      console.log('[WebView] Message:', data.type);
-
       switch (data.type) {
         case 'INITIATE_GOOGLE_LOGIN':
           await initiateGoogleLogin();
           break;
-
         case 'WEBVIEW_READY':
-          // WebView signals it has loaded — nothing to do here
           break;
-
         default:
-          console.log('[WebView] Unknown message type:', data.type);
+          console.log('[WebView] Unknown message:', data.type);
       }
     } catch (error) {
       console.error('[WebView] Message parse error:', error);
     }
   };
 
-  /**
-   * Opens Google OAuth in an in-app browser (ASWebAuthenticationSession on iOS,
-   * Chrome Custom Tab on Android). The browser is dismissed automatically when
-   * it sees the `ajosave://` scheme in the redirect URL.
-   *
-   * FLOW:
-   *   App → openAuthSessionAsync(googleUrl, 'ajosave://') →
-   *   Google consent screen →
-   *   Google redirects to OAUTH_CALLBACK_URL (your Next.js route) →
-   *   Next.js sets session cookie → redirects to `ajosave://auth-complete` →
-   *   Browser closes → openAuthSessionAsync resolves with { type: 'success' } →
-   *   App reloads WebView → user is now logged in
-   */
+  const reenableButtons = () => {
+    webviewRef.current?.injectJavaScript(`
+      (function() {
+        document.querySelectorAll('button[disabled]').forEach(function(btn) {
+          btn.disabled = false;
+        });
+        true;
+      })();
+    `);
+  };
+
   const initiateGoogleLogin = async () => {
     if (authInProgress) return;
     setAuthInProgress(true);
 
+    // Haptic feedback when auth starts
+    await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+
     try {
       const googleUrl = buildGoogleOAuthUrl();
-      console.log('[Auth] Opening Google OAuth URL in in-app browser');
-
-      // Use the exact redirect scheme so Expo knows which return URL to watch for.
       const result = await WebBrowser.openAuthSessionAsync(
         googleUrl,
-        AUTH_SUCCESS_SCHEME
+        AUTH_SUCCESS_SCHEME,
+        {
+          // iOS: show Done button so user can always dismiss
+          showInRecents: false,
+          preferEphemeralSession: false,
+        }
       );
 
-      console.log('[Auth] Browser result:', result.type, result.url ?? '');
-
-      if (result.type === 'success' && result.url?.startsWith(AUTH_SUCCESS_SCHEME)) {
-        // The in-app browser was dismissed because it saw the auth callback URL.
-        // Your Next.js callback has already set the session cookie at this point.
-        setTimeout(() => {
-          webviewRef.current?.reload();
-        }, 400);
-      } else if (result.type === 'success') {
-        // On some platforms the return URL may be returned differently.
-        setTimeout(() => {
-          webviewRef.current?.reload();
-        }, 400);
+      if (result.type === 'success') {
+        await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+        setTimeout(() => webviewRef.current?.reload(), 400);
       } else if (result.type === 'cancel' || result.type === 'dismiss') {
-        // User closed the browser without completing auth — re-enable buttons
-        webviewRef.current?.injectJavaScript(`
-          (function() {
-            document.querySelectorAll('button[disabled]').forEach(function(btn) {
-              btn.disabled = false;
-            });
-            true;
-          })();
-        `);
+        reenableButtons();
       }
     } catch (error) {
       console.error('[Auth] Google login error:', error);
-      webviewRef.current?.injectJavaScript(`
-        (function() {
-          document.querySelectorAll('button[disabled]').forEach(function(btn) {
-            btn.disabled = false;
-          });
-          true;
-        })();
-      `);
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      reenableButtons();
     } finally {
       setAuthInProgress(false);
     }
   };
 
-  // JavaScript injected into every page — signals the app is in a WebView
+  // ── Injected JS ───────────────────────────────────────────────────────────
   const injectedJavaScript = `
     (function() {
+      // Viewport
       var meta = document.querySelector('meta[name="viewport"]');
       if (!meta) {
         meta = document.createElement('meta');
@@ -286,8 +359,13 @@ export default function App() {
       }
       meta.setAttribute('content', 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no');
 
-      // Flag for Next.js components to detect they're inside the native wrapper
+      // Native app flag
       window.__NATIVE_APP__ = true;
+      window.__PLATFORM__ = '${Platform.OS}';
+
+      // Disable pull-to-refresh on Android (prevents accidental reloads)
+      document.body.style.overscrollBehavior = 'none';
+
       window.ReactNativeWebView?.postMessage(
         JSON.stringify({ type: 'WEBVIEW_READY' })
       );
@@ -295,80 +373,139 @@ export default function App() {
     })();
   `;
 
-  // ── Offline screen ─────────────────────────────────────────────────────────
+  // ── Render ────────────────────────────────────────────────────────────────
+  if (!appIsReady) return null;
+
   if (!isConnected) {
-    return (
-      <SafeAreaView style={styles.container}>
-        <StatusBar style="dark" />
-        <View style={styles.offlineContainer}>
-          <Text style={styles.offlineTitle}>No internet connection</Text>
-          <Text style={styles.offlineMessage}>
-            Please connect to a network and try again.
-          </Text>
-        </View>
-      </SafeAreaView>
-    );
+    return <OfflineScreen onRetry={checkNetwork} />;
   }
 
-  // ── Main render ────────────────────────────────────────────────────────────
   return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar style="dark" />
+    <SafeAreaView style={styles.container} edges={['top', 'left', 'right']}>
+      <StatusBar style="dark" backgroundColor="#ffffff" />
+
       <WebView
         ref={webviewRef}
         source={{ uri: `${APP_URL}/login` }}
         originWhitelist={['*']}
-        startInLoadingState
-        renderLoading={() => (
-          <View style={styles.loadingContainer}>
-            <ActivityIndicator size="large" color="#047857" />
-            <Text style={styles.loadingText}>Loading…</Text>
-          </View>
-        )}
-        onLoadStart={() => setIsLoading(true)}
-        onLoadEnd={handleWebViewLoadEnd}
-        onError={handleWebViewLoadEnd}
+        onLoadStart={handleLoadStart}
+        onLoadEnd={handleLoadEnd}
+        onError={handleError}
         onNavigationStateChange={handleNavigationStateChange}
         onShouldStartLoadWithRequest={handleShouldStartLoad}
         onMessage={handleWebViewMessage}
         injectedJavaScript={injectedJavaScript}
+        // Performance
+        cacheEnabled
+        cacheMode="LOAD_CACHE_ELSE_NETWORK"
+        setSupportMultipleWindows={false}
+        // UX
         scalesPageToFit={false}
         allowsInlineMediaPlayback
+        allowsBackForwardNavigationGestures
+        // Cookies / auth
         sharedCookiesEnabled
         thirdPartyCookiesEnabled
         javaScriptEnabled
         domStorageEnabled
-        allowsBackForwardNavigationGestures
+        // Render
         style={styles.webview}
+        // Avoid white flash on navigation
+        renderLoading={() => <View style={styles.webviewPlaceholder} />}
+        startInLoadingState
       />
-      
+
+      <LoadingOverlay visible={isLoading} slowLoad={slowLoad} />
     </SafeAreaView>
   );
 }
 
+// ─── Styles ───────────────────────────────────────────────────────────────────
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#ffffff' },
-  webview: { flex: 1, backgroundColor: '#ffffff' },
-  loadingContainer: {
+  container: {
     flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
     backgroundColor: '#ffffff',
-    padding: 24,
   },
-  loadingText: { marginTop: 12, color: '#047857', fontSize: 16, fontWeight: '500' },
-  spinnerOverlay: {
+  webview: {
+    flex: 1,
+    backgroundColor: '#ffffff',
+  },
+  webviewPlaceholder: {
+    flex: 1,
+    backgroundColor: '#ffffff',
+  },
+
+  // Loading overlay
+  loadingOverlay: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(255,255,255,0.95)',
+    backgroundColor: '#ffffff',
     alignItems: 'center',
     justifyContent: 'center',
+    gap: 12,
   },
-  offlineContainer: {
+  loadingText: {
+    color: '#047857',
+    fontSize: 15,
+    fontWeight: '500',
+    marginTop: 4,
+  },
+  slowLoadHint: {
+    color: '#6b7280',
+    fontSize: 13,
+    textAlign: 'center',
+    lineHeight: 20,
+    marginTop: 4,
+    paddingHorizontal: 32,
+  },
+
+  // Offline screen
+  centeredContent: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 32,
+    gap: 12,
   },
-  offlineTitle: { fontSize: 20, fontWeight: '700', marginBottom: 12, color: '#111827' },
-  offlineMessage: { fontSize: 16, color: '#6b7280', textAlign: 'center', lineHeight: 24 },
+  offlineIconWrap: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    backgroundColor: '#f3f4f6',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 8,
+  },
+  offlineIcon: {
+    fontSize: 32,
+  },
+  offlineTitle: {
+    fontSize: 22,
+    fontWeight: '700',
+    color: '#111827',
+    letterSpacing: -0.3,
+  },
+  offlineMessage: {
+    fontSize: 15,
+    color: '#6b7280',
+    textAlign: 'center',
+    lineHeight: 22,
+  },
+  retryButton: {
+    marginTop: 16,
+    backgroundColor: '#047857',
+    paddingVertical: 14,
+    paddingHorizontal: 40,
+    borderRadius: 12,
+    shadowColor: '#047857',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.25,
+    shadowRadius: 8,
+    elevation: 4,
+  },
+  retryButtonText: {
+    color: '#ffffff',
+    fontSize: 16,
+    fontWeight: '600',
+    letterSpacing: 0.2,
+  },
 });
